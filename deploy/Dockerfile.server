@@ -2,15 +2,17 @@
 FROM alpine AS fetch
 ARG TARGETARCH
 ARG VERSION=latest
+# GitHub repo whose releases provide the binary; forks pass their own.
+ARG REPO=adambie/screenguard
 
 RUN apk add --no-cache curl
 
 RUN set -e; \
     ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "aarch64" || echo "x86_64"); \
     if [ "$VERSION" = "latest" ]; then \
-        URL="https://github.com/adambie/screenguard/releases/latest/download/screenguard-server-${ARCH}"; \
+        URL="https://github.com/${REPO}/releases/latest/download/screenguard-server-${ARCH}"; \
     else \
-        URL="https://github.com/adambie/screenguard/releases/download/${VERSION}/screenguard-server-${ARCH}"; \
+        URL="https://github.com/${REPO}/releases/download/${VERSION}/screenguard-server-${ARCH}"; \
     fi; \
     curl -fsSL "$URL" -o /screenguard-server; \
     chmod +x /screenguard-server
