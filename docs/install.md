@@ -113,6 +113,7 @@ db_path          = "/var/lib/screenguard/server.db"  # SQLite path (ignored when
 # database_url   = "postgres://user:pass@host:5432/screenguard"  # use Postgres instead of SQLite
 enable_mdns      = true
 jwt_expiry_hours = 24
+# github_repo    = "adambie/screenguard"  # releases checked for new agent versions
 ```
 
 ### Agent — `/etc/screenguard/agent.toml`
@@ -126,7 +127,10 @@ user_scan_interval  = 300   # seconds
 cache_ttl_hours     = 48
 min_uid             = 1000  # ignore system accounts below this UID
 app_tracking        = true  # per-app usage reports; false = don't scan, store or send them
+# update_repo       = "adambie/screenguard"  # releases installed by Agents → Update
 ```
+
+`update_repo` is read only from this file: the server can ask the agent to update, but not choose where the update comes from.
 
 ### Environment variables
 
@@ -138,6 +142,8 @@ app_tracking        = true  # per-app usage reports; false = don't scan, store o
 | `DATABASE_URL` | Full database URL — overrides `db_path`. `postgres://…` for Postgres or `sqlite:/path` for SQLite |
 | `SCREENGUARD_SERVER_JWT_SECRET` | JWT signing secret |
 | `SCREENGUARD_SERVER_PORT` | Listen port — overrides `listen_port` (default: `8080`) |
+| `SCREENGUARD_GITHUB_REPO` | Releases checked for new agent versions — overrides `github_repo` |
+| `SCREENGUARD_REPO` | `install.sh`: install releases from this `owner/repo` instead of `adambie/screenguard`. A fresh install also writes it to `github_repo` / `update_repo` |
 
 ## Web UI without the installer
 
