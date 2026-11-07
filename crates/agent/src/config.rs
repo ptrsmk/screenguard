@@ -45,6 +45,12 @@ pub struct AgentConfig {
     /// storing and sending per-app usage on this machine.
     #[serde(default = "default_app_tracking")]
     pub app_tracking: bool,
+
+    /// GitHub repo (`owner/repo`) whose latest release a remote update
+    /// (Agents → Update) installs. Set on the agent, never by the server, so a
+    /// server can only ask for an update, not choose what code runs as root.
+    #[serde(default = "default_update_repo")]
+    pub update_repo: String,
 }
 
 fn default_heartbeat_interval() -> u64 { 10 }
@@ -52,6 +58,24 @@ fn default_user_scan_interval() -> u64 { 300 }
 fn default_cache_ttl_hours() -> u64 { 48 }
 fn default_min_uid() -> u32 { 1000 }
 fn default_app_tracking() -> bool { true }
+fn default_update_repo() -> String { DEFAULT_UPDATE_REPO.to_string() }
+
+pub const DEFAULT_UPDATE_REPO: &str = "adambie/screenguard";
+
+/// `owner/repo` as GitHub allows it: one slash, ASCII letters, digits, `-`,
+/// `_` and `.`, and neither part `.` or `..`.
+pub fn is_valid_repo(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    [owner, name].iter().all(|p| {
+        !p.is_empty()
+            && *p != "."
+            && *p != ".."
+            && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    })
+}
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -65,6 +89,7 @@ impl Default for AgentConfig {
             cache_ttl_hours: default_cache_ttl_hours(),
             min_uid: default_min_uid(),
             app_tracking: default_app_tracking(),
+            update_repo: default_update_repo(),
         }
     }
 }
@@ -94,5 +119,27 @@ mod tests {
         assert!(AgentConfig::default().app_tracking);
         let cfg: AgentConfig = toml::from_str("app_tracking = false").unwrap();
         assert!(!cfg.app_tracking);
+    }
+
+    #[test]
+    fn update_repo_defaults_to_upstream_and_can_be_set() {
+        let cfg: AgentConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.update_repo, "adambie/screenguard");
+        assert_eq!(AgentConfig::default().update_repo, "adambie/screenguard");
+        let cfg: AgentConfig = toml::from_str(r#"update_repo = "someone/screenguard""#).unwrap();
+        assert_eq!(cfg.update_repo, "someone/screenguard");
+    }
+
+    #[test]
+    fn repo_validation() {
+        for ok in ["adambie/screenguard", "some-one/screen_guard.fork", "a/b"] {
+            assert!(is_valid_repo(ok), "{ok}");
+        }
+        for bad in [
+            "", "screenguard", "a/b/c", "/b", "a/", "../b", "a/..", "a b/c",
+            "a/b;rm -rf /", "a/$(id)", "a/b\nc", "ä/b",
+        ] {
+            assert!(!is_valid_repo(bad), "{bad}");
+        }
     }
 }

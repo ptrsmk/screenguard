@@ -337,6 +337,7 @@ async fn main() -> Result<()> {
         nft_available,
         effective_account,
         cfg.app_tracking,
+        cfg.update_repo.clone(),
     );
 
     // SIGTERM: notify systemd STOPPING=1 then exit.

@@ -39,7 +39,7 @@ The complete set (`ServerMessage`, same file):
 | `fetch_logs` | return the last 50 lines of `journalctl -u screenguard-agent` |
 | `update_agent` | run the published installer as root (see below) |
 
-There is no message that runs an arbitrary command, reads a file or opens a shell. `update_agent` is the one privileged operation: it launches `install.sh --update` from the GitHub releases page as root via `systemd-run`, and writes a loud banner to the journal when it does. There is no config switch to turn it off — if that is not acceptable for a machine, self-host, or pin the agent by other means.
+There is no message that runs an arbitrary command, reads a file or opens a shell. `update_agent` is the one privileged operation: it launches `install.sh --update` from the latest GitHub release of the agent's `update_repo` (default `adambie/screenguard`, set only in the agent's own `agent.toml`) as root via `systemd-run`, and writes a loud banner to the journal when it does. There is no config switch to turn it off — if that is not acceptable for a machine, self-host, or pin the agent by other means.
 
 The agent always dials out; nothing ever connects to it. That is why cloud mode needs no port forwarding and no VPN, and it is the same outbound WebSocket in both modes (`wss://` with TLS for the cloud endpoint). Local state — pairing, cached rules, usage counters — stays in `/var/lib/screenguard/agent.db`, everything it does is visible in `journalctl -u screenguard-agent`, and `screenguard-agent --reset` cuts it loose from whichever server it is paired with.
 

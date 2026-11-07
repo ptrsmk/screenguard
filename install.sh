@@ -2,7 +2,10 @@
 set -euo pipefail
 
 # ── config ────────────────────────────────────────────────────────────────────
-REPO="adambie/screenguard"
+# Which GitHub repo's releases to install. SCREENGUARD_REPO overrides it; a
+# fork's release workflow also stamps its own repo in as the default below.
+DEFAULT_REPO="adambie/screenguard"
+REPO="${SCREENGUARD_REPO:-adambie/screenguard}"
 RELEASES_URL="https://github.com/${REPO}/releases/latest/download"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/screenguard"
@@ -60,6 +63,11 @@ confirm() {
 need_cmd curl
 need_cmd systemctl
 
+_owner=${REPO%%/*} _name=${REPO#*/}
+[[ $REPO =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && $_owner != . && $_owner != .. && $_name != . && $_name != .. ]] \
+    || error "SCREENGUARD_REPO must look like owner/repo, got: ${REPO}"
+unset _owner _name
+
 MODE="install"
 DB_URL=""
 CLOUD_ACCOUNT=""
@@ -81,6 +89,9 @@ for arg in "$@"; do
             echo "                            Example: --db-url=postgres://user:pass@host/dbname"
             echo "  --cloud-account=<email>   Agent reports to the hosted cloud service instead"
             echo "                            of a LAN server (experimental). Fresh agent-only installs."
+            echo ""
+            echo "  SCREENGUARD_REPO=<owner/repo>  Install releases from this GitHub repo"
+            echo "                            (default: ${REPO})"
             exit 0
             ;;
     esac
@@ -496,6 +507,9 @@ db_path     = "${DATA_DIR}/server.db"
 enable_mdns = true
 EOF
         fi
+        if [[ $REPO != "$DEFAULT_REPO" ]]; then
+            printf '\n# Releases checked for new agent versions\ngithub_repo = "%s"\n' "$REPO" >> "${CONFIG_DIR}/server.toml"
+        fi
         info "Created ${CONFIG_DIR}/server.toml"
     else
         warn "Config already exists, skipping: ${CONFIG_DIR}/server.toml"
@@ -583,6 +597,9 @@ EOF
 # Cloud mode (experimental): report to the hosted service instead of a LAN server.
 # cloud_account = "you@example.com"
 EOF
+        fi
+        if [[ $REPO != "$DEFAULT_REPO" ]]; then
+            printf '\n# Releases installed by remote updates (Agents → Update)\nupdate_repo = "%s"\n' "$REPO" >> "${CONFIG_DIR}/agent.toml"
         fi
         info "Created ${CONFIG_DIR}/agent.toml"
     elif [[ -n $CLOUD_ACCOUNT ]]; then

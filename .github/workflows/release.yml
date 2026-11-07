@@ -79,6 +79,9 @@ jobs:
           cp deploy/screenguard-tray.desktop   dist/
           cp deploy/screenguard-dbus.conf      dist/
           cp install.sh dist/
+          # A fork's installer defaults to the fork's own releases.
+          sed -i "s|:-adambie/screenguard}|:-${GITHUB_REPOSITORY}}|" dist/install.sh
+          grep -qF "REPO=\"\${SCREENGUARD_REPO:-${GITHUB_REPOSITORY}}\"" dist/install.sh
           tar -czf dist/screenguard-webui.tar.gz \
             --exclude='__pycache__' \
             --exclude='*.pyc' \

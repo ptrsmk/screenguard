@@ -105,6 +105,22 @@ pub struct HeartbeatLoop {
     outstanding_requests: HashMap<(u32, String), common::messages::AppRequest>,
     /// Last seen app names, for decision notifications.
     app_names: HashMap<(u32, String), String>,
+    /// `owner/repo` that remote updates install from (agent.toml `update_repo`).
+    update_repo: String,
+}
+
+/// `systemd-run` arguments for a remote update from `repo`'s latest release.
+/// The repo reaches the shell as an environment variable, never as part of the
+/// script, and install.sh reads the same variable for its own downloads.
+fn update_command_args(repo: &str) -> Vec<String> {
+    vec![
+        "--no-block".into(),
+        "--unit=screenguard-update".into(),
+        format!("--setenv=SCREENGUARD_REPO={repo}"),
+        "/bin/bash".into(),
+        "-c".into(),
+        r#"curl -fsSL "https://github.com/${SCREENGUARD_REPO}/releases/latest/download/install.sh" | bash -s -- --update"#.into(),
+    ]
 }
 
 impl HeartbeatLoop {
@@ -123,6 +139,7 @@ impl HeartbeatLoop {
         web_filter_available: bool,
         cloud_account: Option<String>,
         app_tracking: bool,
+        update_repo: String,
     ) -> Self {
         Self {
             db,
@@ -147,6 +164,7 @@ impl HeartbeatLoop {
             requested: HashSet::new(),
             outstanding_requests: HashMap::new(),
             app_names: HashMap::new(),
+            update_repo,
         }
     }
 
@@ -910,13 +928,16 @@ impl HeartbeatLoop {
                 tracing::warn!("║  Downloading latest release from GitHub and          ║");
                 tracing::warn!("║  installing as root via install.sh --update          ║");
                 tracing::warn!("╚══════════════════════════════════════════════════════╝");
+                if !crate::config::is_valid_repo(&self.update_repo) {
+                    tracing::error!(
+                        "Not updating: update_repo {:?} in agent.toml is not an owner/repo name",
+                        self.update_repo
+                    );
+                    return Ok(());
+                }
+                tracing::warn!("Installing the latest release of {}", self.update_repo);
                 match tokio::process::Command::new("systemd-run")
-                    .args([
-                        "--no-block",
-                        "--unit=screenguard-update",
-                        "/bin/bash", "-c",
-                        "curl -fsSL https://github.com/adambie/screenguard/releases/latest/download/install.sh | bash -s -- --update",
-                    ])
+                    .args(update_command_args(&self.update_repo))
                     .spawn()
                 {
                     Ok(_) => tracing::warn!("Remote update script launched — agent will restart when complete"),
@@ -1380,6 +1401,7 @@ mod tests {
             false,
             None,
             true,
+            "adambie/screenguard".to_string(),
         );
         (hb, outbound_rx)
     }
@@ -1496,5 +1518,15 @@ mod tests {
         let payload: Heartbeat = serde_json::from_value(msg.payload).unwrap();
         assert_eq!(payload.users.len(), 1);
         assert_eq!(payload.users[0].local_uid, 1000);
+    }
+
+    #[test]
+    fn update_command_passes_repo_as_env_not_script() {
+        let args = update_command_args("someone/screenguard");
+        assert!(args.contains(&"--setenv=SCREENGUARD_REPO=someone/screenguard".to_string()));
+        let script = args.last().unwrap();
+        assert!(!script.contains("someone"));
+        assert!(script.contains(r#""https://github.com/${SCREENGUARD_REPO}/releases/latest/download/install.sh""#));
+        assert!(script.ends_with("bash -s -- --update"));
     }
 }
