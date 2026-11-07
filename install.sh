@@ -298,7 +298,7 @@ if [[ $MODE == update ]]; then
     fi
     if [[ $WEBUI_INSTALLED -eq 1 ]]; then
         tar -xzf "${TMP}/screenguard-webui.tar.gz" -C "${WEBUI_DIR}"
-        "${WEBUI_DIR}/venv/bin/pip" install --quiet -r "${WEBUI_DIR}/requirements.txt"
+        "${WEBUI_DIR}/venv/bin/pip" install --quiet --require-hashes -r "${WEBUI_DIR}/requirements.lock"
         cp "${TMP}/screenguard-webui.service" "${SYSTEMD_DIR}/screenguard-webui.service"
         info "Updated screenguard-webui"
     fi
@@ -509,7 +509,7 @@ EOF
         tar -xzf "${TMP}/screenguard-webui.tar.gz" -C "${WEBUI_DIR}"
         info "Extracted web UI to ${WEBUI_DIR}"
         python3 -m venv "${WEBUI_DIR}/venv"
-        "${WEBUI_DIR}/venv/bin/pip" install --quiet -r "${WEBUI_DIR}/requirements.txt"
+        "${WEBUI_DIR}/venv/bin/pip" install --quiet --require-hashes -r "${WEBUI_DIR}/requirements.lock"
         info "Installed Python dependencies"
         if [[ ! -f "${CONFIG_DIR}/webui.env" ]]; then
             WEBUI_SECRET=$(python3 -c "import secrets; print(secrets.token_hex(32))")
