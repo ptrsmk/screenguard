@@ -1,0 +1,54 @@
+# Fork maintenance: keep `main` an exact mirror of upstream and flag new upstream releases.
+#
+# Lives on `deploy` (the fork's default branch) because scheduled workflows only run there.
+# `main` is fast-forward only: if it has diverged from upstream the sync fails loudly
+# instead of overwriting anything.
+#
+# GITHUB_TOKEN cannot push commits that touch .github/workflows/. When upstream changes a
+# workflow, the sync step fails until a SYNC_TOKEN secret exists: a fine-grained PAT for
+# this repo with "Contents: read and write" and "Workflows: read and write".
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM: adambie/screenguard
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fast-forward main to upstream
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: gh repo sync "$GITHUB_REPOSITORY" --source "$UPSTREAM" --branch main
+
+      - name: Open an issue for a new upstream release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo "$UPSTREAM" --json tagName -q .tagName)
+          title="Upstream released $tag"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --limit 100 \
+            --search "\"$title\" in:title" --json title -q '.[].title')
+          if grep -Fxq "$title" <<<"$existing"; then
+            echo "Already tracked: $title"
+            exit 0
+          fi
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$(cat <<EOF
+          Upstream published [$tag](https://github.com/$UPSTREAM/releases/tag/$tag).
+
+          - [ ] Read the release notes and diff since the version we run
+          - [ ] Rebase \`deploy\` onto \`$tag\`, resolve conflicts, drop patches upstream merged
+          - [ ] Tag \`$tag-d1\` on \`deploy\` and let CI build it
+          - [ ] Run the update from the Proxmox host
+          EOF
+          )"
