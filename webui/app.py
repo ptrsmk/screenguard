@@ -3,7 +3,7 @@ Parental Controller – simple management web UI.
 
 Usage:
     cd webui
-    pip install -r requirements.txt
+    pip install --require-hashes -r requirements.lock
     SERVER_URL=http://localhost:8080 python app.py
 """
 
