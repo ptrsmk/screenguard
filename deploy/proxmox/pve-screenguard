@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# pve-screenguard — run the ScreenGuard server in a Proxmox LXC.
+# Runs on the Proxmox host; drives screenguard-update inside the container.
+#
+#   pve-screenguard create [options]          create a Debian 13 container and install ScreenGuard
+#       --vmid N           container ID (default: next free)
+#       --hostname NAME    (default: screenguard)
+#       --storage NAME     root disk storage (default: local-lvm)
+#       --template-storage NAME  where the Debian template lives (default: local)
+#       --bridge NAME      (default: vmbr0)
+#       --ip CIDR|dhcp     e.g. 192.168.1.50/24 (default: dhcp)
+#       --gw ADDR          gateway, with a static --ip
+#       --tag TAG          release to install (default: latest)
+#   pve-screenguard update VMID [TAG]         snapshot the container, then update (default: latest)
+#   pve-screenguard rollback VMID [TAG]       switch back to the previous release (code only)
+#   pve-screenguard restore VMID [SNAPSHOT]   roll the whole container back to a pre-update snapshot
+#   pve-screenguard status VMID
+#
+# Environment: SCREENGUARD_REPO (owner/repo whose releases are used),
+# KEEP_SNAPSHOTS (pre-update snapshots kept, default 3).
+set -euo pipefail
+
+REPO=${SCREENGUARD_REPO:-adambie/screenguard}
+KEEP_SNAPSHOTS=${KEEP_SNAPSHOTS:-3}
+SNAP_PREFIX=sgpre_
+
+info() { echo "[✓] $*"; }
+warn() { echo "[!] $*" >&2; }
+die()  { echo "[✗] $*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
+
+valid_repo() {
+    local owner=${1%%/*} name=${1#*/}
+    [[ $1 =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && $owner != . && $owner != .. && $name != . && $name != .. ]]
+}
+valid_tag() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; }
+
+resolve_tag() {
+    local tag=$1 url
+    if [[ $tag == latest ]]; then
+        url=$(curl -fsSLI --retry 3 -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest") \
+            || die "Could not look up the latest release of ${REPO}"
+        [[ $url == */releases/tag/* ]] || die "${REPO} has no published release"
+        tag=${url##*/}
+    fi
+    valid_tag "$tag" || die "Not a release tag: $tag"
+    echo "$tag"
+}
+
+require_ct() {
+    [[ $1 =~ ^[0-9]+$ ]] || die "Not a container ID: $1"
+    pct status "$1" &>/dev/null || die "Container $1 not found"
+}
+
+# Push the screenguard-update that belongs to <tag> into the container, so the
+# updater always matches the release it installs.
+push_updater() (  # vmid tag; subshell so the cleanup trap stays local
+    tmp=$(mktemp -d)
+    trap 'rm -rf -- "$tmp"' EXIT
+    local url="https://github.com/${REPO}/releases/download/$2"
+    curl -fsSL --retry 3 -o "$tmp/screenguard-update" "$url/screenguard-update" \
+        || die "Release $2 has no screenguard-update asset"
+    curl -fsSL --retry 3 -o "$tmp/sha256" "$url/screenguard-update.sha256" \
+        || die "Release $2 has no screenguard-update.sha256 asset"
+    local expected actual
+    read -r expected _ < "$tmp/sha256" || true
+    actual=$(sha256sum "$tmp/screenguard-update" | cut -d' ' -f1)
+    [[ -n $expected && $expected == "$actual" ]] || die "Checksum mismatch: screenguard-update"
+    pct push "$1" "$tmp/screenguard-update" /usr/local/sbin/screenguard-update --perms 0755
+)
+
+ct_run() {  # vmid command...
+    local vmid=$1; shift
+    pct exec "$vmid" -- env SCREENGUARD_REPO="$REPO" "$@"
+}
+
+# ── create ────────────────────────────────────────────────────────────────────
+cmd_create() {
+    local vmid="" hostname=screenguard storage=local-lvm tstorage=local bridge=vmbr0 ip=dhcp gw="" tag=latest
+    while (( $# )); do
+        case $1 in
+            --vmid)             vmid=$2; shift 2 ;;
+            --hostname)         hostname=$2; shift 2 ;;
+            --storage)          storage=$2; shift 2 ;;
+            --template-storage) tstorage=$2; shift 2 ;;
+            --bridge)           bridge=$2; shift 2 ;;
+            --ip)               ip=$2; shift 2 ;;
+            --gw)               gw=$2; shift 2 ;;
+            --tag)              tag=$2; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+    [[ -n $vmid ]] || vmid=$(pvesh get /cluster/nextid)
+    [[ $vmid =~ ^[0-9]+$ ]] || die "Not a container ID: $vmid"
+    pct status "$vmid" &>/dev/null && die "Container ${vmid} already exists"
+    [[ $ip == dhcp || -z $gw || $ip == */* ]] || die "--ip needs a prefix length, e.g. 192.168.1.50/24"
+    tag=$(resolve_tag "$tag")
+
+    info "Finding the Debian 13 template"
+    pveam update >/dev/null || warn "pveam update failed; using the cached template list"
+    local tmpl
+    tmpl=$(pveam available --section system | awk '{print $2}' \
+        | grep -E '^debian-13-standard_.*_amd64\.tar\.(zst|xz|gz)$' | sort -V | tail -n1)
+    [[ -n $tmpl ]] || die "No debian-13-standard template offered by pveam"
+    if ! pveam list "$tstorage" | grep -qF "$tmpl"; then
+        info "Downloading ${tmpl}"
+        pveam download "$tstorage" "$tmpl"
+    fi
+
+    local net="name=eth0,bridge=${bridge},ip=${ip}"
+    [[ -n $gw ]] && net+=",gw=${gw}"
+    info "Creating container ${vmid} (${hostname})"
+    pct create "$vmid" "${tstorage}:vztmpl/${tmpl}" \
+        --hostname "$hostname" \
+        --unprivileged 1 \
+        --features nesting=1 \
+        --cores 1 --memory 512 --swap 256 \
+        --rootfs "${storage}:4" \
+        --net0 "$net" \
+        --onboot 1 \
+        --timezone host \
+        --tags screenguard \
+        --description "ScreenGuard server (${REPO}). Updated with pve-screenguard."
+    pct start "$vmid"
+
+    info "Waiting for the network"
+    local i
+    for i in $(seq 60); do
+        pct exec "$vmid" -- getent hosts github.com &>/dev/null && break
+        (( i == 60 )) && die "Container ${vmid} has no working network/DNS after 60s"
+        sleep 1
+    done
+
+    info "Updating Debian and enabling automatic security updates"
+    pct exec "$vmid" -- bash -euc '
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get -y -qq full-upgrade >/dev/null
+        apt-get install -y -qq --no-install-recommends unattended-upgrades curl ca-certificates >/dev/null
+        printf "%s\n" "APT::Periodic::Update-Package-Lists \"1\";" "APT::Periodic::Unattended-Upgrade \"1\";" \
+            > /etc/apt/apt.conf.d/20auto-upgrades
+        systemctl enable --now --quiet unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer
+    '
+
+    push_updater "$vmid" "$tag"
+    ct_run "$vmid" screenguard-update install "$tag"
+
+    local addr
+    addr=$(pct exec "$vmid" -- hostname -I | awk '{print $1}')
+    echo
+    info "ScreenGuard ${tag} is running in container ${vmid}"
+    echo "    Web UI:  http://${addr}:5000   (create the administrator account now)"
+    echo "    Agents:  server_url = \"ws://${addr}:8080\""
+    echo "    Update:  pve-screenguard update ${vmid}"
+}
+
+# ── update / rollback / restore ───────────────────────────────────────────────
+list_snapshots() {  # vmid → our pre-update snapshot names, oldest first
+    pct listsnapshot "$1" | grep -oE "${SNAP_PREFIX}[0-9]{8}T[0-9]{6}" | sort -u
+}
+
+cmd_update() {
+    local vmid=${1:-} tag snap
+    [[ -n $vmid ]] || die "Usage: pve-screenguard update VMID [TAG]"
+    require_ct "$vmid"
+    tag=$(resolve_tag "${2:-latest}")
+
+    push_updater "$vmid" "$tag"
+
+    snap="${SNAP_PREFIX}$(date -u +%Y%m%dT%H%M%S)"
+    if pct snapshot "$vmid" "$snap" --description "Before ScreenGuard ${tag}" >/dev/null 2>&1; then
+        info "Snapshot ${snap} taken"
+    else
+        warn "Could not snapshot container ${vmid} (storage without snapshot support?)"
+        warn "Continuing; screenguard-update still backs up the database inside the container"
+        snap=""
+    fi
+
+    if ! ct_run "$vmid" screenguard-update update "$tag"; then
+        warn "Update failed. screenguard-update has tried to roll itself back (see above)."
+        [[ -n $snap ]] && warn "To return the whole container to before the update: pve-screenguard restore ${vmid} ${snap}"
+        exit 1
+    fi
+
+    local old
+    while read -r old; do
+        [[ -n $old ]] || continue
+        pct delsnapshot "$vmid" "$old" >/dev/null && info "Deleted old snapshot ${old}"
+    done < <(list_snapshots "$vmid" | head -n -"${KEEP_SNAPSHOTS}")
+}
+
+cmd_rollback() {
+    local vmid=${1:-}
+    [[ -n $vmid ]] || die "Usage: pve-screenguard rollback VMID [TAG]"
+    require_ct "$vmid"
+    ct_run "$vmid" screenguard-update rollback ${2:+"$2"}
+}
+
+cmd_restore() {
+    local vmid=${1:-} snap=${2:-}
+    [[ -n $vmid ]] || die "Usage: pve-screenguard restore VMID [SNAPSHOT]"
+    require_ct "$vmid"
+    [[ -n $snap ]] || snap=$(list_snapshots "$vmid" | tail -n1)
+    [[ -n $snap ]] || die "No ${SNAP_PREFIX}* snapshots on container ${vmid}"
+    list_snapshots "$vmid" | grep -qxF "$snap" || die "No snapshot ${snap} on container ${vmid}"
+    warn "This returns container ${vmid} to ${snap}: code, settings AND all usage data since then."
+    local answer
+    read -r -p "Type the container ID to confirm: " answer
+    [[ $answer == "$vmid" ]] || die "Not confirmed"
+    pct shutdown "$vmid" --timeout 60 || pct stop "$vmid"
+    pct rollback "$vmid" "$snap"
+    pct start "$vmid"
+    info "Container ${vmid} restored to ${snap}"
+}
+
+cmd_status() {
+    local vmid=${1:-}
+    [[ -n $vmid ]] || die "Usage: pve-screenguard status VMID"
+    require_ct "$vmid"
+    pct exec "$vmid" -- screenguard-update status
+    echo "Pre-update snapshots:"
+    list_snapshots "$vmid" | sed 's/^/  /'
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+cmd=${1:-}
+[[ -n $cmd ]] || { usage; exit 1; }
+shift
+case $cmd in
+    -h|--help|help) usage; exit 0 ;;
+esac
+[[ $EUID -eq 0 ]] || die "Run as root on the Proxmox host"
+command -v pct >/dev/null || die "pct not found — run this on the Proxmox host"
+valid_repo "$REPO" || die "SCREENGUARD_REPO must look like owner/repo, got: ${REPO}"
+[[ $KEEP_SNAPSHOTS =~ ^[1-9][0-9]*$ ]] || die "KEEP_SNAPSHOTS must be a positive number"
+
+case $cmd in
+    create)   cmd_create "$@" ;;
+    update)   cmd_update "$@" ;;
+    rollback) cmd_rollback "$@" ;;
+    restore)  cmd_restore "$@" ;;
+    status)   cmd_status "$@" ;;
+    *)        usage; exit 1 ;;
+esac

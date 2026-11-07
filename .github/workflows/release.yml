@@ -86,6 +86,15 @@ jobs:
             --exclude='__pycache__' \
             --exclude='*.pyc' \
             -C webui .
+          # Proxmox LXC scripts (deploy/proxmox), also defaulting to this repo.
+          for f in pve-screenguard screenguard-update; do
+            cp "deploy/proxmox/$f" dist/
+            sed -i "s|:-adambie/screenguard}|:-${GITHUB_REPOSITORY}}|" "dist/$f"
+            grep -qF ":-${GITHUB_REPOSITORY}}" "dist/$f"
+          done
+          for f in screenguard-webui.tar.gz pve-screenguard screenguard-update; do
+            sha256sum "dist/$f" | awk '{print $1}' > "dist/$f.sha256"
+          done
 
       - uses: softprops/action-gh-release@v2
         with:

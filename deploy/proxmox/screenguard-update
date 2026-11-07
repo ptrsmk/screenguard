@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+# screenguard-update — install, update and roll back the ScreenGuard server and
+# web UI on a Debian machine (made for a Proxmox LXC; works on any Debian/systemd).
+#
+# Each release lives side by side in /opt/screenguard/releases/<tag> with its own
+# Python venv; /opt/screenguard/current points at the running one. An update
+# downloads and verifies a release, backs up the database, switches the link,
+# restarts and health-checks. If the check fails, it puts back the database
+# and the previous release by itself.
+#
+#   screenguard-update install [TAG]   first-time setup, then deploy TAG (default: latest)
+#   screenguard-update update  [TAG]   deploy TAG (default: latest)
+#   screenguard-update rollback [TAG]  switch back to the previous (or given) release; code only
+#   screenguard-update backup          back up the database now
+#   screenguard-update status          show releases, services and health
+#
+# Settings: /etc/screenguard/update.conf (shell syntax), see write_update_conf.
+set -euo pipefail
+
+CONFIG_DIR=/etc/screenguard
+UPDATE_CONF=$CONFIG_DIR/update.conf
+BASE=/opt/screenguard
+RELEASES=$BASE/releases
+CURRENT=$BASE/current
+PREVIOUS_FILE=$BASE/previous
+BACKUP_DIR=/var/backups/screenguard
+UNIT_DIR=/etc/systemd/system
+SERVICE_USER=screenguard
+LOCK=/run/lock/screenguard-update.lock
+
+# Defaults; update.conf overrides them, SCREENGUARD_REPO overrides REPO.
+unset REPO
+KEEP_RELEASES=3
+KEEP_BACKUPS=10
+SERVER_PORT=8080
+UI_PORT=5000
+DB_PATH=/var/lib/screenguard/server.db
+HEALTH_TIMEOUT=60
+DOWNLOAD_BASE=""   # default: https://github.com/$REPO/releases/download
+
+# shellcheck source=/dev/null
+[[ -f $UPDATE_CONF ]] && . "$UPDATE_CONF"
+REPO=${SCREENGUARD_REPO:-${REPO:-adambie/screenguard}}
+DOWNLOAD_BASE=${DOWNLOAD_BASE:-https://github.com/${REPO}/releases/download}
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+info() { echo "[✓] $*"; }
+warn() { echo "[!] $*" >&2; }
+die()  { echo "[✗] $*" >&2; exit 1; }
+
+valid_repo() {
+    local owner=${1%%/*} name=${1#*/}
+    [[ $1 =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && $owner != . && $owner != .. && $name != . && $name != .. ]]
+}
+valid_tag() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; }
+
+fetch() { curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 -o "$2" "$1" || die "Download failed: $1"; }
+
+verify_sha256() {  # file, file holding the expected hex digest
+    local expected actual
+    read -r expected _ < "$2" || true
+    actual=$(sha256sum "$1" | cut -d' ' -f1)
+    [[ -n $expected && $expected == "$actual" ]] || die "Checksum mismatch: $(basename "$1")"
+}
+
+arch() {
+    case $(uname -m) in
+        x86_64)        echo x86_64 ;;
+        aarch64|arm64) echo aarch64 ;;
+        *) die "Unsupported architecture: $(uname -m)" ;;
+    esac
+}
+
+current_tag() { [[ -L $CURRENT ]] && basename "$(readlink "$CURRENT")" || true; }
+
+resolve_tag() {  # "latest" → newest release tag of $REPO
+    local tag=$1
+    if [[ $tag == latest ]]; then
+        local url
+        url=$(curl -fsSLI --retry 3 -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest") \
+            || die "Could not look up the latest release of ${REPO}"
+        tag=${url##*/}
+        [[ $url == */releases/tag/* ]] || die "${REPO} has no published release"
+    fi
+    valid_tag "$tag" || die "Not a release tag: $tag"
+    echo "$tag"
+}
+
+switch_to() {  # atomically point current at releases/<tag>
+    ln -sfn "releases/$1" "$BASE/.current.new"
+    mv -Tf "$BASE/.current.new" "$CURRENT"
+}
+
+restart_services() { systemctl restart screenguard-server.service screenguard-webui.service; }
+
+healthy() {  # server reports the expected version and the web UI answers
+    local want=${1#v} deadline=$((SECONDS + HEALTH_TIMEOUT)) got
+    while (( SECONDS < deadline )); do
+        got=$(curl -fsS --max-time 3 "http://127.0.0.1:${SERVER_PORT}/api/v1/version" 2>/dev/null \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null) || got=""
+        if [[ $got == "$want" ]] \
+            && curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:${UI_PORT}/login" 2>/dev/null; then
+            return 0
+        fi
+        sleep 2
+    done
+    warn "Health check failed (server reports version '${got:-none}', expected '${want}')"
+    return 1
+}
+
+# ── database backup / restore (SQLite) ────────────────────────────────────────
+LAST_BACKUP=""
+backup_db() {  # label
+    LAST_BACKUP=""
+    if [[ ! -f $DB_PATH ]]; then
+        warn "No database at ${DB_PATH} yet — nothing to back up"
+        return 0
+    fi
+    install -d -m 0700 "$BACKUP_DIR"
+    local dest
+    dest="$BACKUP_DIR/server-$(date -u +%Y%m%dT%H%M%SZ)-$1.db"
+    # sqlite3's online backup API: consistent even while the server is writing.
+    python3 - "$DB_PATH" "$dest" <<'EOF'
+import sqlite3, sys
+src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+dst = sqlite3.connect(sys.argv[2])
+src.backup(dst)
+dst.close(); src.close()
+EOF
+    chmod 0600 "$dest"
+    LAST_BACKUP=$dest
+    info "Database backed up to ${dest}"
+    find "$BACKUP_DIR" -maxdepth 1 -name 'server-*.db' -printf '%T@ %p\n' | sort -rn \
+        | tail -n +$((KEEP_BACKUPS + 1)) | cut -d' ' -f2- | xargs -r rm -f --
+}
+
+restore_db() {  # backup file; services must be stopped
+    rm -f -- "${DB_PATH}-wal" "${DB_PATH}-shm"
+    install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_USER" "$1" "$DB_PATH"
+    info "Database restored from $1"
+}
+
+# ── first-time setup ──────────────────────────────────────────────────────────
+write_update_conf() {
+    [[ -f $UPDATE_CONF ]] && return 0
+    cat > "$UPDATE_CONF" <<EOF
+# screenguard-update settings (shell syntax)
+REPO=${REPO}              # GitHub owner/repo whose releases are installed
+KEEP_RELEASES=${KEEP_RELEASES}           # releases kept in ${RELEASES} (current and previous always kept)
+KEEP_BACKUPS=${KEEP_BACKUPS}           # database backups kept in ${BACKUP_DIR}
+SERVER_PORT=${SERVER_PORT}          # must match listen_port in server.toml
+UI_PORT=${UI_PORT}              # must match UI_PORT in webui.env
+DB_PATH=${DB_PATH}
+HEALTH_TIMEOUT=${HEALTH_TIMEOUT}        # seconds to wait for a healthy start after an update
+EOF
+    info "Created ${UPDATE_CONF}"
+}
+
+write_configs() {
+    install -d -m 0755 "$CONFIG_DIR"
+    write_update_conf
+    if [[ ! -f $CONFIG_DIR/server.toml ]]; then
+        cat > "$CONFIG_DIR/server.toml" <<EOF
+listen_addr = "0.0.0.0"
+listen_port = ${SERVER_PORT}
+db_path     = "${DB_PATH}"
+# Agents are given a fixed server_url; set true to let them find the server via mDNS.
+enable_mdns = false
+# Releases checked for new agent versions.
+github_repo = "${REPO}"
+EOF
+        info "Created ${CONFIG_DIR}/server.toml"
+    fi
+    if [[ ! -f $CONFIG_DIR/server.env ]]; then
+        # Without a fixed secret every restart logs out the web UI and the phone app.
+        ( umask 077; printf 'SCREENGUARD_SERVER_JWT_SECRET=%s\n' "$(openssl rand -hex 32)" > "$CONFIG_DIR/server.env" )
+        info "Created ${CONFIG_DIR}/server.env (JWT secret)"
+    fi
+    if [[ ! -f $CONFIG_DIR/webui.env ]]; then
+        ( umask 077; printf 'SERVER_URL=http://127.0.0.1:%s\nSECRET_KEY=%s\nUI_PORT=%s\n' \
+            "$SERVER_PORT" "$(openssl rand -hex 32)" "$UI_PORT" > "$CONFIG_DIR/webui.env" )
+        info "Created ${CONFIG_DIR}/webui.env (session secret)"
+    fi
+}
+
+write_units() {
+    cat > "$UNIT_DIR/screenguard-server.service" <<EOF
+# Managed by screenguard-update; rewritten on every update.
+[Unit]
+Description=ScreenGuard server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+Environment=SCREENGUARD_SERVER_CONFIG=${CONFIG_DIR}/server.toml
+EnvironmentFile=${CONFIG_DIR}/server.env
+ExecStart=${CURRENT}/bin/screenguard-server
+Restart=always
+RestartSec=5
+WatchdogSec=60
+StateDirectory=screenguard
+StateDirectoryMode=0750
+UMask=0077
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    cat > "$UNIT_DIR/screenguard-webui.service" <<EOF
+# Managed by screenguard-update; rewritten on every update.
+[Unit]
+Description=ScreenGuard web UI
+After=network-online.target screenguard-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+EnvironmentFile=${CONFIG_DIR}/webui.env
+WorkingDirectory=${CURRENT}/webui
+ExecStart=${CURRENT}/venv/bin/python -m gunicorn --workers 2 --bind 0.0.0.0:\${UI_PORT} app:app
+Restart=always
+RestartSec=5
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
+bootstrap() {
+    command -v apt-get >/dev/null || die "This script expects Debian (apt-get not found)"
+    info "Installing system packages"
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        ca-certificates curl openssl python3 python3-venv >/dev/null
+    if ! id "$SERVICE_USER" &>/dev/null; then
+        useradd --system --home-dir /var/lib/screenguard --no-create-home \
+            --shell /usr/sbin/nologin "$SERVICE_USER"
+        info "Created system user ${SERVICE_USER}"
+    fi
+    install -d -m 0755 "$BASE" "$RELEASES"
+    write_configs
+    local self
+    self=$(readlink -f "$0")
+    if [[ $self != /usr/local/sbin/screenguard-update ]]; then
+        install -m 0755 "$self" /usr/local/sbin/screenguard-update
+        info "Installed /usr/local/sbin/screenguard-update"
+    fi
+}
+
+# ── releases ──────────────────────────────────────────────────────────────────
+stage_release() {  # tag → $RELEASES/<tag>, complete or not at all
+    local tag=$1 a url stage
+    a=$(arch)
+    url="${DOWNLOAD_BASE}/${tag}"
+    stage="$RELEASES/.staging-${tag}"
+    rm -rf -- "$stage"
+    install -d -m 0755 "$stage/bin" "$stage/webui"
+
+    info "Downloading ${REPO} ${tag} (${a})"
+    fetch "${url}/screenguard-server-${a}"        "$stage/bin/screenguard-server"
+    fetch "${url}/screenguard-server-${a}.sha256" "$stage/server.sha256"
+    verify_sha256 "$stage/bin/screenguard-server" "$stage/server.sha256"
+    chmod 0755 "$stage/bin/screenguard-server"
+    fetch "${url}/screenguard-webui.tar.gz"        "$stage/webui.tar.gz"
+    fetch "${url}/screenguard-webui.tar.gz.sha256" "$stage/webui.sha256"
+    verify_sha256 "$stage/webui.tar.gz" "$stage/webui.sha256"
+    info "Checksums OK"
+    tar -xzf "$stage/webui.tar.gz" -C "$stage/webui" --no-same-owner
+    rm -f -- "$stage/webui.tar.gz" "$stage"/*.sha256
+    [[ -f $stage/webui/requirements.lock ]] \
+        || die "Release ${tag} has no webui/requirements.lock; refusing unpinned dependencies"
+
+    info "Building the web UI environment"
+    python3 -m venv "$stage/venv"
+    "$stage/venv/bin/python" -m pip install --quiet --disable-pip-version-check --no-cache-dir \
+        --require-hashes -r "$stage/webui/requirements.lock"
+    echo "$tag" > "$stage/TAG"
+    chmod -R u=rwX,go=rX "$stage"
+
+    rm -rf -- "${RELEASES:?}/${tag}"
+    mv -T "$stage" "$RELEASES/$tag"
+}
+
+prune_releases() {  # keep KEEP_RELEASES in total, always including current and previous
+    local cur prev name n=0 others
+    cur=$(current_tag)
+    prev=$(cat "$PREVIOUS_FILE" 2>/dev/null || true)
+    others=$((KEEP_RELEASES - 1 - (${#prev} > 0 ? 1 : 0)))
+    while read -r _ name; do
+        [[ $name == "$cur" || $name == "$prev" ]] && continue
+        n=$((n + 1))
+        if (( n > others )); then
+            rm -rf -- "${RELEASES:?}/${name}"
+            info "Removed old release ${name}"
+        fi
+    done < <(find "$RELEASES" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@ %f\n' | sort -rn)
+}
+
+deploy() {  # tag
+    local tag prev
+    tag=$(resolve_tag "$1")
+    prev=$(current_tag)
+    if [[ $tag == "$prev" ]]; then
+        info "Already running ${tag}"
+        healthy "$tag" || exit 1
+        info "Healthy"
+        return 0
+    fi
+
+    stage_release "$tag"
+    backup_db "pre-${tag}"
+    local backup=$LAST_BACKUP old_previous
+    old_previous=$(cat "$PREVIOUS_FILE" 2>/dev/null || true)
+
+    write_units
+    switch_to "$tag"
+    [[ -n $prev ]] && echo "$prev" > "$PREVIOUS_FILE"
+    systemctl enable --quiet screenguard-server.service screenguard-webui.service
+    info "Starting ${tag}"
+    restart_services
+
+    if healthy "$tag"; then
+        info "ScreenGuard ${tag} is running${prev:+ (was ${prev})}"
+        prune_releases
+        return 0
+    fi
+
+    journalctl -u screenguard-server -u screenguard-webui -n 30 --no-pager >&2 || true
+    if [[ -z $prev ]]; then
+        die "${tag} did not start; nothing to roll back to"
+    fi
+    warn "Rolling back to ${prev}"
+    systemctl stop screenguard-webui.service screenguard-server.service
+    # The new version may already have migrated the database: restore the copy
+    # taken just before the switch (loses at most the last few seconds).
+    [[ -n $backup ]] && restore_db "$backup"
+    switch_to "$prev"
+    if [[ -n $old_previous ]]; then echo "$old_previous" > "$PREVIOUS_FILE"; else rm -f -- "$PREVIOUS_FILE"; fi
+    rm -rf -- "${RELEASES:?}/${tag}"
+    restart_services
+    if healthy "$prev"; then
+        die "Update to ${tag} failed; rolled back to ${prev}, which is running"
+    fi
+    die "Update to ${tag} failed and ${prev} is not healthy either — check journalctl; a host snapshot may be needed"
+}
+
+rollback() {  # [tag]
+    local cur target
+    cur=$(current_tag)
+    target=${1:-$(cat "$PREVIOUS_FILE" 2>/dev/null || true)}
+    [[ -n $target ]] || die "No previous release recorded; give a tag (see: screenguard-update status)"
+    valid_tag "$target" && [[ -d $RELEASES/$target ]] || die "Release ${target} is not installed"
+    [[ $target != "$cur" ]] || die "Already running ${target}"
+    warn "Switching code back to ${target}. The database is left as it is; if ${cur} changed its"
+    warn "schema, restore a backup from ${BACKUP_DIR} or the host snapshot taken before the update."
+    switch_to "$target"
+    echo "$cur" > "$PREVIOUS_FILE"
+    restart_services
+    healthy "$target" || die "${target} is not healthy — check journalctl"
+    info "Running ${target}"
+}
+
+status() {
+    local cur prev name
+    cur=$(current_tag)
+    prev=$(cat "$PREVIOUS_FILE" 2>/dev/null || true)
+    echo "Repo:     ${REPO}"
+    echo "Current:  ${cur:-none}"
+    echo "Previous: ${prev:-none}"
+    echo "Installed releases:"
+    while read -r _ name; do
+        echo "  ${name}$([[ $name == "$cur" ]] && echo '  (current)')"
+    done < <(find "$RELEASES" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@ %f\n' 2>/dev/null | sort -rn)
+    for svc in screenguard-server screenguard-webui; do
+        printf '%-20s %s\n' "$svc:" "$(systemctl is-active "$svc" 2>/dev/null || true)"
+    done
+    echo "Server reports: $(curl -fsS --max-time 3 "http://127.0.0.1:${SERVER_PORT}/api/v1/version" 2>/dev/null || echo unreachable)"
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
+
+cmd=${1:-}
+[[ -n $cmd ]] || { usage; exit 1; }
+shift
+case $cmd in
+    -h|--help|help) usage; exit 0 ;;
+esac
+[[ $EUID -eq 0 ]] || die "Run as root"
+valid_repo "$REPO" || die "REPO must look like owner/repo, got: ${REPO}"
+
+exec 9>"$LOCK"
+flock -n 9 || die "Another screenguard-update is running"
+
+case $cmd in
+    install)  bootstrap; deploy "${1:-latest}" ;;
+    update)   [[ -d $RELEASES ]] || die "Not installed yet; run: screenguard-update install"
+              deploy "${1:-latest}" ;;
+    rollback) rollback "${1:-}" ;;
+    backup)   backup_db manual ;;
+    status)   status ;;
+    *)        usage; exit 1 ;;
+esac
