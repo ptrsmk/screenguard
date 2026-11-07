@@ -69,9 +69,12 @@ push_updater() (  # vmid tag; subshell so the cleanup trap stays local
     pct push "$1" "$tmp/screenguard-update" /usr/local/sbin/screenguard-update --perms 0755
 )
 
+# pct exec inherits the caller's environment but not a full PATH (no /usr/local/sbin),
+# and a forwarded LANG makes perl/apt complain inside a container without that locale.
 ct_run() {  # vmid command...
     local vmid=$1; shift
-    pct exec "$vmid" -- env SCREENGUARD_REPO="$REPO" "$@"
+    pct exec "$vmid" -- env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        HOME=/root LANG=C.UTF-8 SCREENGUARD_REPO="$REPO" "$@"
 }
 
 # ── create ────────────────────────────────────────────────────────────────────
@@ -126,13 +129,13 @@ cmd_create() {
     info "Waiting for the network"
     local i
     for i in $(seq 60); do
-        pct exec "$vmid" -- getent hosts github.com &>/dev/null && break
+        ct_run "$vmid" getent hosts github.com &>/dev/null && break
         (( i == 60 )) && die "Container ${vmid} has no working network/DNS after 60s"
         sleep 1
     done
 
     info "Updating Debian and enabling automatic security updates"
-    pct exec "$vmid" -- bash -euc '
+    ct_run "$vmid" bash -euc '
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
         apt-get -y -qq full-upgrade >/dev/null
@@ -146,7 +149,7 @@ cmd_create() {
     ct_run "$vmid" screenguard-update install "$tag"
 
     local addr
-    addr=$(pct exec "$vmid" -- hostname -I | awk '{print $1}')
+    addr=$(ct_run "$vmid" hostname -I | awk '{print $1}')
     echo
     info "ScreenGuard ${tag} is running in container ${vmid}"
     echo "    Web UI:  http://${addr}:5000   (create the administrator account now)"
@@ -156,7 +159,7 @@ cmd_create() {
 
 # ── update / rollback / restore ───────────────────────────────────────────────
 list_snapshots() {  # vmid → our pre-update snapshot names, oldest first
-    pct listsnapshot "$1" | grep -oE "${SNAP_PREFIX}[0-9]{8}T[0-9]{6}" | sort -u
+    pct listsnapshot "$1" | { grep -oE "${SNAP_PREFIX}[0-9]{8}T[0-9]{6}" || true; } | sort -u
 }
 
 cmd_update() {
@@ -217,7 +220,7 @@ cmd_status() {
     local vmid=${1:-}
     [[ -n $vmid ]] || die "Usage: pve-screenguard status VMID"
     require_ct "$vmid"
-    pct exec "$vmid" -- screenguard-update status
+    ct_run "$vmid" screenguard-update status
     echo "Pre-update snapshots:"
     list_snapshots "$vmid" | sed 's/^/  /'
 }
