@@ -101,6 +101,14 @@ trait Systemd1Manager {
     fn stop_unit(&self, name: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
 
     fn kill_unit(&self, name: &str, who: &str, signal: i32) -> zbus::Result<()>;
+
+    fn get_unit(&self, name: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+}
+
+#[proxy(interface = "org.freedesktop.systemd1.Unit", default_service = "org.freedesktop.systemd1")]
+trait Systemd1Unit {
+    #[zbus(property)]
+    fn active_state(&self) -> zbus::Result<String>;
 }
 
 /// Plasma's own logout (what "Log Out" in the menu ends up calling), no confirmation.
@@ -110,6 +118,8 @@ trait Systemd1Manager {
     default_path = "/Shutdown"
 )]
 trait KdeShutdown {
+    // KDE's method is lower-case; zbus would otherwise call "Logout".
+    #[zbus(name = "logout")]
     fn logout(&self) -> zbus::Result<()>;
 }
 
@@ -536,7 +546,7 @@ pub async fn logout_desktop_as_current_user(kind: &str) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
-            tracing::debug!("Desktop logout ({kind}) failed: {e}");
+            tracing::warn!("Desktop logout ({kind}) failed: {e}");
             1
         }
     }
@@ -564,6 +574,16 @@ async fn request_desktop_logout(uid: u32, kind: DesktopLogout) -> bool {
     )
     .await;
     matches!(result, Ok(Ok(s)) if s.success())
+}
+
+/// Whether a systemd unit is done stopping (inactive, failed, or already unloaded).
+async fn unit_stopped(conn: &Connection, systemd: &Systemd1ManagerProxy<'_>, unit: &str) -> bool {
+    let Ok(path) = systemd.get_unit(unit).await else { return true };
+    let state = async {
+        Systemd1UnitProxy::builder(conn).path(path)?.build().await?.active_state().await
+    }
+    .await;
+    matches!(state.as_deref(), Ok("inactive") | Ok("failed"))
 }
 
 /// true once logind no longer knows the session, false if it is still there after `wait`.
@@ -634,13 +654,32 @@ pub async fn terminate_sessions(session_ids: &[String]) -> Result<()> {
                             Ok(_) => tracing::info!("Stopping {unit} (compositor and user services)"),
                             Err(e) => tracing::warn!("StopUnit {unit} failed: {e}"),
                         }
-                        if wait_session_gone(&manager, sid, USER_STOP_WAIT).await {
+                        // Done when the session is gone, or as soon as the user manager has
+                        // stopped (the compositor has then released the GPU and VT); the
+                        // scope's leftovers are handled by the next step.
+                        let deadline = tokio::time::Instant::now() + USER_STOP_WAIT;
+                        let mut stopped = false;
+                        while tokio::time::Instant::now() < deadline {
+                            if manager.get_session(sid).await.is_err() {
+                                break;
+                            }
+                            if unit_stopped(&conn, &systemd, &unit).await {
+                                stopped = true;
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        }
+                        if manager.get_session(sid).await.is_err() {
                             tracing::info!("Session {sid} ended after stopping {unit}");
                             continue;
                         }
-                        match systemd.kill_unit(&unit, "all", 9).await {
-                            Ok(()) => tracing::info!("Sent SIGKILL to {unit}"),
-                            Err(e) => tracing::debug!("KillUnit {unit}: {e}"),
+                        if stopped {
+                            tracing::info!("{unit} stopped; ending what is left of session {sid}");
+                        } else {
+                            match systemd.kill_unit(&unit, "all", 9).await {
+                                Ok(()) => tracing::warn!("{unit} still running after {USER_STOP_WAIT:?}, sent SIGKILL"),
+                                Err(e) => tracing::debug!("KillUnit {unit}: {e}"),
+                            }
                         }
                     }
                     Err(e) => tracing::warn!("Cannot reach systemd to stop {unit}: {e}"),
