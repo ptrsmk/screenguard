@@ -93,6 +93,37 @@ trait Login1Session {
 }
 
 #[proxy(
+    interface = "org.freedesktop.systemd1.Manager",
+    default_service = "org.freedesktop.systemd1",
+    default_path = "/org/freedesktop/systemd1"
+)]
+trait Systemd1Manager {
+    fn stop_unit(&self, name: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+
+    fn kill_unit(&self, name: &str, who: &str, signal: i32) -> zbus::Result<()>;
+}
+
+/// Plasma's own logout (what "Log Out" in the menu ends up calling), no confirmation.
+#[proxy(
+    interface = "org.kde.Shutdown",
+    default_service = "org.kde.Shutdown",
+    default_path = "/Shutdown"
+)]
+trait KdeShutdown {
+    fn logout(&self) -> zbus::Result<()>;
+}
+
+#[proxy(
+    interface = "org.gnome.SessionManager",
+    default_service = "org.gnome.SessionManager",
+    default_path = "/org/gnome/SessionManager"
+)]
+trait GnomeSessionManager {
+    /// mode 1 = log out without the confirmation dialog.
+    fn logout(&self, mode: u32) -> zbus::Result<()>;
+}
+
+#[proxy(
     interface = "org.cinnamon.ScreenSaver",
     default_service = "org.cinnamon.ScreenSaver",
     default_path = "/org/cinnamon/ScreenSaver"
@@ -451,18 +482,172 @@ pub async fn unlock_sessions(session_ids: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Terminate all sessions in the given list.
+/// Desktops whose own logout the agent knows how to request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DesktopLogout {
+    Kde,
+    Gnome,
+}
+
+impl DesktopLogout {
+    fn arg(self) -> &'static str {
+        match self {
+            DesktopLogout::Kde => "kde",
+            DesktopLogout::Gnome => "gnome",
+        }
+    }
+}
+
+/// Which desktop logout to ask for, from logind's `Desktop` / XDG_CURRENT_DESKTOP value.
+/// Unknown desktops get `None` and go straight to the forced steps.
+pub(crate) fn desktop_logout_for(desktop: &str) -> Option<DesktopLogout> {
+    let parts: Vec<String> =
+        desktop.split([':', ';']).map(|p| p.trim().to_ascii_lowercase()).collect();
+    if parts.iter().any(|p| p == "kde" || p == "plasma") {
+        Some(DesktopLogout::Kde)
+    } else if parts.iter().any(|p| p == "gnome" || p == "gnome-classic" || p == "gnome-flashback") {
+        Some(DesktopLogout::Gnome)
+    } else {
+        None
+    }
+}
+
+/// Called when the agent binary is invoked with `--logout-desktop <kde|gnome>` as the
+/// session user (so it may talk to that user's session bus). Exit 0 = request accepted.
+pub async fn logout_desktop_as_current_user(kind: &str) -> i32 {
+    let conn = match Connection::session().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("Cannot connect to session bus for desktop logout: {e}");
+            return 1;
+        }
+    };
+    let result = match kind {
+        "kde" => match KdeShutdownProxy::new(&conn).await {
+            Ok(p) => p.logout().await,
+            Err(e) => Err(e),
+        },
+        "gnome" => match GnomeSessionManagerProxy::new(&conn).await {
+            Ok(p) => p.logout(1).await,
+            Err(e) => Err(e),
+        },
+        _ => return 2,
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            tracing::debug!("Desktop logout ({kind}) failed: {e}");
+            1
+        }
+    }
+}
+
+/// Ask the user's desktop to log out the normal way, by running the agent as that user.
+async fn request_desktop_logout(uid: u32, kind: DesktopLogout) -> bool {
+    if !std::path::Path::new(&format!("/run/user/{uid}/bus")).exists() {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let gid = lookup_gid_for_uid(uid).unwrap_or(uid);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new(exe)
+            .arg("--logout-desktop")
+            .arg(kind.arg())
+            .env_clear()
+            .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path=/run/user/{uid}/bus"))
+            .env("XDG_RUNTIME_DIR", format!("/run/user/{uid}"))
+            .uid(uid)
+            .gid(gid)
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await;
+    matches!(result, Ok(Ok(s)) if s.success())
+}
+
+/// true once logind no longer knows the session, false if it is still there after `wait`.
+async fn wait_session_gone(manager: &Login1ManagerProxy<'_>, sid: &str, wait: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if manager.get_session(sid).await.is_err() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// How long the desktop's own logout gets (apps may ask to save their work meanwhile).
+const DESKTOP_LOGOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long stopping the user's services (compositor included) gets before SIGKILL.
+const USER_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Terminate all sessions in the given list, in the order a normal logout would.
 ///
-/// First SIGKILLs only the session user's processes, leaving the display manager's
-/// session leader alive so it sees a normal logout and brings the greeter back (see
-/// `session_kill`). If the session is still there after `LOGOUT_WAIT`, falls back to
-/// Manager.KillSession(..., "all", SIGKILL), which always ends it. SIGKILL either way, so
-/// lock-screen daemons (kscreenlocker, swaylock, etc.) that resist SIGTERM are removed.
+/// 1. Ask the desktop (KDE, GNOME) to log out as usual, and give it `DESKTOP_LOGOUT_WAIT`.
+/// 2. Stop the user's service manager (`user@UID.service`), which holds the compositor on
+///    Plasma 6 and GNOME. The compositor has to release the GPU and VT before the greeter
+///    starts, otherwise the greeter comes up without a display. SIGKILL it if it resists.
+/// 3. SIGKILL the session user's processes in the session scope, leaving the display
+///    manager's session leader alive so it sees a normal logout and brings the greeter
+///    back (see `session_kill`).
+/// 4. Last resort: Manager.KillSession(..., "all", SIGKILL), which always ends it.
+///
+/// Steps 1-2 can be delayed by the child's apps but never prevent steps 3-4. SIGKILL is
+/// used for the forced steps so lock-screen daemons that resist SIGTERM are removed.
 pub async fn terminate_sessions(session_ids: &[String]) -> Result<()> {
     let conn = Connection::system().await?;
     let manager = Login1ManagerProxy::new(&conn).await?;
 
     for sid in session_ids {
+        let info = async {
+            let path = manager.get_session(sid).await?;
+            let session = Login1SessionProxy::builder(&conn).path(path)?.build().await?;
+            let (uid, _) = session.user().await?;
+            let desktop = session.desktop().await.unwrap_or_default();
+            anyhow::Ok((uid, desktop))
+        }
+        .await;
+
+        if let Ok((uid, desktop)) = info.as_ref().map(|(u, d)| (*u, d.as_str())) {
+            if let Some(kind) = desktop_logout_for(desktop) {
+                if request_desktop_logout(uid, kind).await {
+                    tracing::info!("Asked the {desktop} desktop of uid={uid} to log out session {sid}");
+                    if wait_session_gone(&manager, sid, DESKTOP_LOGOUT_WAIT).await {
+                        tracing::info!("Session {sid} logged out by the desktop");
+                        continue;
+                    }
+                    tracing::warn!("Session {sid} still present {DESKTOP_LOGOUT_WAIT:?} after desktop logout, forcing");
+                } else {
+                    tracing::warn!("Desktop logout request ({desktop}) failed for uid={uid}, forcing");
+                }
+            }
+
+            if uid != 0 {
+                let unit = format!("user@{uid}.service");
+                match Systemd1ManagerProxy::new(&conn).await {
+                    Ok(systemd) => {
+                        match systemd.stop_unit(&unit, "replace").await {
+                            Ok(_) => tracing::info!("Stopping {unit} (compositor and user services)"),
+                            Err(e) => tracing::warn!("StopUnit {unit} failed: {e}"),
+                        }
+                        if wait_session_gone(&manager, sid, USER_STOP_WAIT).await {
+                            tracing::info!("Session {sid} ended after stopping {unit}");
+                            continue;
+                        }
+                        match systemd.kill_unit(&unit, "all", 9).await {
+                            Ok(()) => tracing::info!("Sent SIGKILL to {unit}"),
+                            Err(e) => tracing::debug!("KillUnit {unit}: {e}"),
+                        }
+                    }
+                    Err(e) => tracing::warn!("Cannot reach systemd to stop {unit}: {e}"),
+                }
+            }
+        }
+
         match logout_keeping_leader(&conn, &manager, sid).await {
             Ok(true) => {
                 tracing::info!("Session {sid} ended; display manager's session leader kept alive");
@@ -511,9 +696,9 @@ async fn logout_keeping_leader(
         tokio::task::spawn_blocking(move || crate::session_kill::kill_user_processes(&dir, uid, leader))
             .await?
     };
-    if first == 0 {
-        anyhow::bail!("no processes of uid {uid} in {}", dir.display());
-    }
+    // Zero is fine: after the earlier steps the session may only be waiting for its
+    // leader to close PAM. Waiting below then lets it finish on its own, instead of the
+    // KillSession fallback killing the leader.
     tracing::info!("Sent SIGKILL to {first} process(es) of uid={uid} in session {sid} (leader {leader} spared)");
 
     let deadline = tokio::time::Instant::now() + LOGOUT_WAIT;
@@ -621,7 +806,27 @@ trait Notifications {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_cinnamon, session_counts_usage, uid_counts_usage, SessionUsageState};
+    use super::{
+        desktop_logout_for, is_cinnamon, session_counts_usage, uid_counts_usage, DesktopLogout,
+        SessionUsageState,
+    };
+
+    #[test]
+    fn desktop_logout_picks_kde_and_gnome() {
+        assert_eq!(desktop_logout_for("KDE"), Some(DesktopLogout::Kde));
+        assert_eq!(desktop_logout_for("kde"), Some(DesktopLogout::Kde));
+        assert_eq!(desktop_logout_for("GNOME"), Some(DesktopLogout::Gnome));
+        assert_eq!(desktop_logout_for("ubuntu:GNOME"), Some(DesktopLogout::Gnome));
+        assert_eq!(desktop_logout_for("GNOME-Classic:GNOME"), Some(DesktopLogout::Gnome));
+    }
+
+    #[test]
+    fn desktop_logout_skips_unknown_desktops() {
+        // These go straight to the forced steps.
+        for d in ["", "X-Cinnamon", "XFCE", "Hyprland", "sway", "KDEish"] {
+            assert_eq!(desktop_logout_for(d), None, "{d}");
+        }
+    }
 
     fn state(active: bool, locked: bool, idle: bool) -> SessionUsageState {
         SessionUsageState {

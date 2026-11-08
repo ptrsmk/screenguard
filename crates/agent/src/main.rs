@@ -132,6 +132,13 @@ async fn main() -> Result<()> {
         std::process::exit(crate::dbus::lock_cinnamon_as_current_user().await);
     }
 
+    // Handle --logout-desktop <kde|gnome>: ask the current user's desktop to log out and exit.
+    // Spawned by the agent under the target uid, like --lock-cinnamon.
+    if args.get(1).map(String::as_str) == Some("--logout-desktop") {
+        let kind = args.get(2).map(String::as_str).unwrap_or("");
+        std::process::exit(crate::dbus::logout_desktop_as_current_user(kind).await);
+    }
+
     // Handle --notify <summary> <body>: send a desktop notification as the current user and exit.
     // The agent spawns itself under the target uid, so at this point we are already that user.
     if args.get(1).map(String::as_str) == Some("--notify") {
