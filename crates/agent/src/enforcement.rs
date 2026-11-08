@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{Datelike, Local, NaiveTime};
 use common::models::EnforceAction;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -128,6 +128,55 @@ fn should_warn_before_lock(grace_minutes: u32) -> bool {
     grace_minutes > 0
 }
 
+/// UIDs currently in their "save your work" window. The heartbeat's re-lock loop skips
+/// them, otherwise it would lock the screen within ~10 s and cut the window short.
+static SAVE_WINDOW: std::sync::Mutex<BTreeSet<u32>> = std::sync::Mutex::new(BTreeSet::new());
+
+pub fn in_save_window(uid: u32) -> bool {
+    SAVE_WINDOW.lock().map(|s| s.contains(&uid)).unwrap_or(false)
+}
+
+/// Marks `uid` as being in its save window until dropped.
+struct SaveWindowGuard(u32);
+
+impl SaveWindowGuard {
+    fn enter(uid: u32) -> Self {
+        if let Ok(mut s) = SAVE_WINDOW.lock() {
+            s.insert(uid);
+        }
+        SaveWindowGuard(uid)
+    }
+}
+
+impl Drop for SaveWindowGuard {
+    fn drop(&mut self) {
+        if let Ok(mut s) = SAVE_WINDOW.lock() {
+            s.remove(&self.0);
+        }
+    }
+}
+
+/// What happens between "time is up" and the lock.
+#[derive(Debug, PartialEq, Eq)]
+enum PreLock {
+    /// Critical "save your work now" warning, session stays usable for this long.
+    SaveWindow(u32),
+    /// The short courtesy notice (no save window configured).
+    Notice,
+    /// Lock at once.
+    Immediate,
+}
+
+fn pre_lock(save_window_seconds: u32, grace_minutes: u32) -> PreLock {
+    if save_window_seconds > 0 {
+        PreLock::SaveWindow(save_window_seconds)
+    } else if should_warn_before_lock(grace_minutes) {
+        PreLock::Notice
+    } else {
+        PreLock::Immediate
+    }
+}
+
 /// Execute a lock for a UID, preserving or terminating the session according to cached config.
 ///
 /// `locked_uids` is the same set the caller inserted `uid` into to arm this lock. It is
@@ -140,11 +189,17 @@ pub async fn execute_lock(
     db: &Arc<Mutex<Db>>,
     locked_uids: &Arc<Mutex<HashSet<u32>>>,
 ) -> Result<bool> {
-    let (session_ids, grace_minutes, language, preserve_tasks) = {
+    let (session_ids, grace_minutes, language, preserve_tasks, save_window) = {
         let db = db.lock().await;
         let sessions = db.get_all_session_ids(uid)?;
         let enforcement = db.get_cached_enforcement(uid)?;
-        (sessions, enforcement.lockout_grace_minutes, enforcement.language, enforcement.preserve_tasks_on_lock)
+        (
+            sessions,
+            enforcement.lockout_grace_minutes,
+            enforcement.language,
+            enforcement.preserve_tasks_on_lock,
+            enforcement.save_window_seconds,
+        )
     };
 
     if session_ids.is_empty() {
@@ -152,13 +207,35 @@ pub async fn execute_lock(
     }
 
     // Final warning before the screen locks.
-    if should_warn_before_lock(grace_minutes) {
-        let _ = crate::dbus::send_desktop_notification(
-            uid,
-            crate::i18n::notif_lock_title(&language),
-            crate::i18n::notif_lock_body(&language),
-        ).await;
-        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    match pre_lock(save_window, grace_minutes) {
+        PreLock::SaveWindow(secs) => {
+            let _guard = SaveWindowGuard::enter(uid);
+            tracing::info!("uid={uid}: time is up, {secs} s to save work before the lock");
+            let _ = crate::dbus::send_urgent_notification(
+                uid,
+                crate::i18n::notif_lock_title(&language),
+                &crate::i18n::notif_save_body(&language, secs),
+            ).await;
+            tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
+            if !locked_uids.lock().await.contains(&uid) {
+                tracing::info!("uid={uid}: block lifted during the save window — not locking");
+                return Ok(true);
+            }
+        }
+        PreLock::Notice => {
+            let _ = crate::dbus::send_desktop_notification(
+                uid,
+                crate::i18n::notif_lock_title(&language),
+                crate::i18n::notif_lock_body(&language),
+            ).await;
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        }
+        PreLock::Immediate => {}
+    }
+    // Sessions may have changed while the child was saving.
+    let session_ids = db.lock().await.get_all_session_ids(uid)?;
+    if session_ids.is_empty() {
+        return Ok(true);
     }
 
     tracing::info!("Locking sessions for uid={uid}: {:?}", session_ids);
@@ -215,6 +292,26 @@ mod tests {
     #[test]
     fn zero_grace_skips_the_pre_lock_warning() {
         assert!(!should_warn_before_lock(0));
+    }
+
+    #[test]
+    fn save_window_takes_precedence_and_zero_falls_back() {
+        use super::{pre_lock, PreLock};
+        assert_eq!(pre_lock(30, 1), PreLock::SaveWindow(30));
+        assert_eq!(pre_lock(30, 0), PreLock::SaveWindow(30));
+        assert_eq!(pre_lock(0, 5), PreLock::Notice);
+        assert_eq!(pre_lock(0, 0), PreLock::Immediate);
+    }
+
+    #[test]
+    fn save_window_guard_marks_and_clears_the_uid() {
+        use super::{in_save_window, SaveWindowGuard};
+        assert!(!in_save_window(4242));
+        {
+            let _g = SaveWindowGuard::enter(4242);
+            assert!(in_save_window(4242));
+        }
+        assert!(!in_save_window(4242));
     }
 
     #[test]

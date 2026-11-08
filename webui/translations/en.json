@@ -70,6 +70,9 @@
   "profile.keep_tasks_running_hint": "When time runs out, ScreenGuard keeps the login screen locked but does not terminate the session. The allowance is still zeroed out.",
   "profile.grace_minutes_label": "Grace period before logout",
   "profile.grace_minutes_unit": "min",
+  "profile.save_window_label": "Time to save work before the lock",
+  "profile.save_window_unit": "s",
+  "profile.save_window_hint": "When time is up, a warning stays on screen telling the child to save their work now; the screen locks this many seconds later. Set to 0 to lock straight away (with only a 4-second notice).",
   "profile.grace_minutes_hint": "After locking, the session is forcibly terminated after this many minutes (only when 'keep tasks running' is off). Set to 0 for immediate logout with no warning before the lock screen engages.",
   "profile.btn_save_lock_behavior": "Save lock behavior",
 

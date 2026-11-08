@@ -144,7 +144,8 @@ async fn main() -> Result<()> {
     if args.get(1).map(String::as_str) == Some("--notify") {
         let summary = args.get(2).map(String::as_str).unwrap_or("");
         let body = args.get(3).map(String::as_str).unwrap_or("");
-        if let Err(e) = crate::dbus::notify_as_current_user(summary, body).await {
+        let urgent = args.get(4).map(String::as_str) == Some("urgent");
+        if let Err(e) = crate::dbus::notify_as_current_user(summary, body, urgent).await {
             tracing::warn!("Notification failed: {e}");
         }
         return Ok(());

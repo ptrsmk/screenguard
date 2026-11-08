@@ -314,6 +314,7 @@ async fn send_config_push(
             adjustment_message: None,
             lockout_grace_minutes: 5,
             preserve_tasks_on_lock: false,
+            save_window_seconds: 30,
             warning_thresholds_minutes: vec![15, 5, 1],
             language: "en".to_string(),
             blocked_domains: Vec::new(),

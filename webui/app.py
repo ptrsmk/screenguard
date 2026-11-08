@@ -507,6 +507,7 @@ def profile_detail(profile_id):
                            status=status,
                            preserve_tasks_on_lock=data.get("preserve_tasks_on_lock", False),
                            lockout_grace_minutes=data.get("lockout_grace_minutes", 5),
+                           save_window_seconds=data.get("save_window_seconds", 30),
                            sites=sites,
                            admin_tz=admin_tz,
                            board=board,
@@ -865,8 +866,13 @@ def set_lock_behavior(profile_id):
         grace = max(0, min(60, int(request.form.get("lockout_grace_minutes", 5))))
     except (ValueError, TypeError):
         grace = 5
+    try:
+        save_window = max(0, min(300, int(request.form.get("save_window_seconds", 30))))
+    except (ValueError, TypeError):
+        save_window = 30
     r = api("PATCH", f"/profiles/{profile_id}",
-            json={"preserve_tasks_on_lock": preserve, "lockout_grace_minutes": grace})
+            json={"preserve_tasks_on_lock": preserve, "lockout_grace_minutes": grace,
+                  "save_window_seconds": save_window})
     flash(t("flash.lock_behavior_saved") if (r and r.ok) else t("flash.lock_failed"),
           "success" if (r and r.ok) else "danger")
     return redirect(url_for("profile_detail", profile_id=profile_id))

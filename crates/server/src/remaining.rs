@@ -214,6 +214,7 @@ pub async fn build_config_push(pool: &DbPool, agent_id: Uuid, config_version: i6
             adjustment_message,
             lockout_grace_minutes: enforcement.lockout_grace_minutes as u32,
             preserve_tasks_on_lock: enforcement.preserve_tasks_on_lock,
+            save_window_seconds: enforcement.save_window_seconds.max(0) as u32,
             warning_thresholds_minutes: enforcement
                 .warning_thresholds
                 .iter()

@@ -39,6 +39,9 @@ impl Db {
         let _ = self.conn.execute_batch(
             "ALTER TABLE cached_enforcement ADD COLUMN preserve_tasks_on_lock INTEGER NOT NULL DEFAULT 0",
         );
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE cached_enforcement ADD COLUMN save_window_seconds INTEGER NOT NULL DEFAULT 30",
+        );
         // Experimental cloud mode: records which cloud account (email) this
         // pairing is bound to. NULL for self-hosted / local-network pairings.
         let _ = self.conn.execute_batch(
@@ -165,6 +168,7 @@ impl Db {
                 lockout_grace_minutes   INTEGER NOT NULL DEFAULT 5,
                 warning_thresholds      TEXT NOT NULL DEFAULT '15,5,1',
                 preserve_tasks_on_lock  INTEGER NOT NULL DEFAULT 0,
+                save_window_seconds     INTEGER NOT NULL DEFAULT 30,
                 PRIMARY KEY (local_uid)
             );
 
@@ -414,8 +418,9 @@ impl Db {
 
             tx.execute(
                 "INSERT OR REPLACE INTO cached_enforcement
-                 (local_uid, lockout_grace_minutes, warning_thresholds, language, preserve_tasks_on_lock)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (local_uid, lockout_grace_minutes, warning_thresholds, language, preserve_tasks_on_lock,
+                  save_window_seconds)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     u.local_uid,
                     u.lockout_grace_minutes,
@@ -426,6 +431,7 @@ impl Db {
                         .join(","),
                     &u.language,
                     u.preserve_tasks_on_lock,
+                    u.save_window_seconds,
                 ],
             )?;
 
@@ -882,6 +888,7 @@ pub struct CachedEnforcement {
     pub warning_thresholds: Vec<u32>,
     pub language: String,
     pub preserve_tasks_on_lock: bool,
+    pub save_window_seconds: u32,
 }
 
 impl Default for CachedEnforcement {
@@ -891,6 +898,7 @@ impl Default for CachedEnforcement {
             warning_thresholds: vec![15, 5, 1],
             language: "en".to_string(),
             preserve_tasks_on_lock: false,
+            save_window_seconds: 30,
         }
     }
 }
@@ -937,11 +945,12 @@ impl Db {
     }
 
     pub fn get_cached_enforcement(&self, uid: u32) -> Result<CachedEnforcement> {
-        let (grace, thresholds_str, language, preserve_tasks): (u32, String, String, bool) = self.conn.query_row(
-            "SELECT lockout_grace_minutes, warning_thresholds, language, preserve_tasks_on_lock FROM cached_enforcement WHERE local_uid = ?1",
+        let (grace, thresholds_str, language, preserve_tasks, save_window): (u32, String, String, bool, u32) = self.conn.query_row(
+            "SELECT lockout_grace_minutes, warning_thresholds, language, preserve_tasks_on_lock, save_window_seconds
+             FROM cached_enforcement WHERE local_uid = ?1",
             params![uid],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        ).unwrap_or((5, "15,5,1".to_string(), "en".to_string(), false));
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap_or((5, "15,5,1".to_string(), "en".to_string(), false, 30));
 
         let thresholds = thresholds_str
             .split(',')
@@ -953,6 +962,7 @@ impl Db {
             warning_thresholds: thresholds,
             language,
             preserve_tasks_on_lock: preserve_tasks,
+            save_window_seconds: save_window,
         })
     }
 
@@ -1026,6 +1036,7 @@ mod tests {
             adjustment_message: None,
             lockout_grace_minutes: 5,
             preserve_tasks_on_lock,
+            save_window_seconds: 30,
             warning_thresholds_minutes: vec![15, 5, 1],
             language: "en".to_string(),
             blocked_domains: Vec::new(),
@@ -1057,6 +1068,7 @@ mod tests {
         db.migrate().unwrap();
 
         assert!(!db.get_cached_enforcement(1000).unwrap().preserve_tasks_on_lock);
+        assert_eq!(db.get_cached_enforcement(1000).unwrap().save_window_seconds, 30);
     }
 
     // Regression test for #17: after the first reconnect of the day marks a

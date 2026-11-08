@@ -27,6 +27,10 @@ pub struct UserConfig {
     pub lockout_grace_minutes: u32,
     #[serde(default)]
     pub preserve_tasks_on_lock: bool,
+    /// Seconds between the "save your work" warning and the lock; 0 = lock at once.
+    /// Absent from older servers, which locked after a 4 s notice.
+    #[serde(default = "default_save_window_seconds")]
+    pub save_window_seconds: u32,
     pub warning_thresholds_minutes: Vec<u32>,
     #[serde(default = "default_lang")]
     pub language: String,
@@ -69,6 +73,10 @@ pub struct AppGroupConfig {
 
 fn is_zero(v: &i32) -> bool {
     *v == 0
+}
+
+fn default_save_window_seconds() -> u32 {
+    30
 }
 
 fn default_lang() -> String { "en".to_string() }
@@ -163,6 +171,8 @@ mod tests {
         let config: UserConfig = serde_json::from_str(json).unwrap();
 
         assert!(!config.preserve_tasks_on_lock);
+        // Older servers don't send it: default to a 30 s save window.
+        assert_eq!(config.save_window_seconds, 30);
     }
 
     #[test]
@@ -182,6 +192,7 @@ mod tests {
         value["preserve_tasks_on_lock"] = serde_json::Value::Bool(false);
         value["language"] = serde_json::Value::String("en".to_string());
         value["blocked_domains"] = serde_json::json!([]);
+        value["save_window_seconds"] = serde_json::json!(30);
 
         assert_eq!(serde_json::to_value(config).unwrap(), value);
     }

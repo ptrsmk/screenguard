@@ -53,6 +53,7 @@ pub async fn get_profile(
         "agent_users": users,
         "preserve_tasks_on_lock": enforcement.preserve_tasks_on_lock,
         "lockout_grace_minutes": enforcement.lockout_grace_minutes,
+        "save_window_seconds": enforcement.save_window_seconds,
     })))
 }
 
@@ -62,6 +63,7 @@ pub struct PatchProfileBody {
     pub language: Option<String>,
     pub preserve_tasks_on_lock: Option<bool>,
     pub lockout_grace_minutes: Option<u32>,
+    pub save_window_seconds: Option<u32>,
 }
 
 fn lock_now_adjustment(limit: i32, adjustments: i32, used_minutes: i32) -> i32 {
@@ -88,6 +90,11 @@ pub async fn patch_profile(
     }
     if let Some(grace) = body.lockout_grace_minutes {
         db::set_lockout_grace_minutes(&state.db, id, grace).await.map_err(internal)?;
+        bump_and_propagate(&state, id).await.map_err(internal)?;
+    }
+    if let Some(secs) = body.save_window_seconds {
+        // Same ceiling as the web UI: long enough to save, short enough not to be extra time.
+        db::set_save_window_seconds(&state.db, id, secs.min(300)).await.map_err(internal)?;
         bump_and_propagate(&state, id).await.map_err(internal)?;
     }
     Ok(Json(serde_json::json!({ "message": "Profile updated" })))

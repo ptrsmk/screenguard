@@ -822,6 +822,9 @@ impl HeartbeatLoop {
                             // Lock flow already armed — silently re-lock in case the user bypassed
                             // the lock screen, without resetting a grace timer that may be running.
                             let uid = entry.local_uid;
+                            if crate::enforcement::in_save_window(uid) {
+                                continue;
+                            }
                             tracing::info!("Re-locking uid={uid}: session remains active while blocked");
                             let db = self.db.clone();
                             tokio::spawn(async move {
@@ -884,6 +887,8 @@ impl HeartbeatLoop {
                             locked_uids.lock().await.remove(&uid);
                         }
                     });
+                } else if crate::enforcement::in_save_window(uid) {
+                    tracing::info!("uid={uid}: lock_now during the save window — locking when it ends");
                 } else {
                     tracing::info!("Re-locking uid={uid}: lock_now while grace/preserve already armed");
                     let db = self.db.clone();
@@ -1070,7 +1075,7 @@ impl HeartbeatLoop {
                                     locked_uids.lock().await.remove(&uid);
                                 }
                             });
-                        } else {
+                        } else if !crate::enforcement::in_save_window(uid) {
                             let db = self.db.clone();
                             tokio::spawn(async move {
                                 let session_ids = db.lock().await
@@ -1370,6 +1375,7 @@ mod tests {
             adjustment_message: None,
             lockout_grace_minutes: 5,
             preserve_tasks_on_lock: false,
+            save_window_seconds: 30,
             warning_thresholds_minutes: vec![15, 5, 1],
             language: "en".to_string(),
             blocked_domains: Vec::new(),

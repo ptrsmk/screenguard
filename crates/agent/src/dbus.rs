@@ -758,6 +758,16 @@ async fn logout_keeping_leader(
 /// This avoids the D-Bus peer-credential rejection that occurs when root connects directly
 /// to a user's session bus socket.
 pub async fn send_desktop_notification(uid: u32, summary: &str, body: &str) -> Result<()> {
+    send_notification(uid, summary, body, false).await
+}
+
+/// Like `send_desktop_notification`, but critical: it stays on screen until dismissed and
+/// is shown over full-screen apps.
+pub async fn send_urgent_notification(uid: u32, summary: &str, body: &str) -> Result<()> {
+    send_notification(uid, summary, body, true).await
+}
+
+async fn send_notification(uid: u32, summary: &str, body: &str, urgent: bool) -> Result<()> {
     let socket = format!("/run/user/{uid}/bus");
     if !std::path::Path::new(&socket).exists() {
         tracing::debug!("No session bus for uid={uid}, skipping notification");
@@ -771,6 +781,7 @@ pub async fn send_desktop_notification(uid: u32, summary: &str, body: &str) -> R
         .arg("--notify")
         .arg(summary)
         .arg(body)
+        .args(urgent.then_some("urgent"))
         .env_clear()
         .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path=/run/user/{uid}/bus"))
         .env("XDG_RUNTIME_DIR", format!("/run/user/{uid}"))
@@ -798,12 +809,19 @@ pub async fn send_desktop_notification(uid: u32, summary: &str, body: &str) -> R
 /// Called when the agent binary is invoked with `--notify`.
 /// At this point the process is already running as the target user, so the session
 /// bus connection uses the correct peer credentials.
-pub async fn notify_as_current_user(summary: &str, body: &str) -> Result<()> {
+pub async fn notify_as_current_user(summary: &str, body: &str, urgent: bool) -> Result<()> {
     let conn = zbus::Connection::session().await?;
     let proxy = NotificationsProxy::new(&conn).await?;
-    let hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+    let mut hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+    let (icon, timeout) = if urgent {
+        // urgency 2 = critical: no timeout, drawn over full-screen windows.
+        hints.insert("urgency", zbus::zvariant::Value::U8(2));
+        ("dialog-warning", 0)
+    } else {
+        ("dialog-information", 5000)
+    };
     let _ = proxy
-        .notify("ScreenGuard", 0, "dialog-information", summary, body, &[], hints, 5000)
+        .notify("ScreenGuard", 0, icon, summary, body, &[], hints, timeout)
         .await;
     Ok(())
 }

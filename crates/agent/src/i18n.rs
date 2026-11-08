@@ -20,6 +20,18 @@ pub fn notif_lock_body(lang: &str) -> &'static str {
     }
 }
 
+/// Final warning before the lock: the child still has `secs` seconds to save.
+pub fn notif_save_body(lang: &str, secs: u32) -> String {
+    match lang {
+        "es" => format!("Guarda tu trabajo ahora. La pantalla se bloqueará en {secs} segundos; lo que no esté guardado se perderá."),
+        "fr" => format!("Enregistre ton travail maintenant. L'écran sera verrouillé dans {secs} secondes ; ce qui n'est pas enregistré sera perdu."),
+        "de" => format!("Speichere jetzt deine Arbeit. Der Bildschirm wird in {secs} Sekunden gesperrt; Ungespeichertes geht verloren."),
+        "pt" => format!("Guarda o teu trabalho agora. O ecrã será bloqueado em {secs} segundos; o que não estiver guardado perde-se."),
+        "pl" => format!("Zapisz teraz swoją pracę. Ekran zostanie zablokowany za {secs} s; niezapisane zmiany przepadną."),
+        _    => format!("Save your work now. Your screen locks in {secs} seconds, and anything unsaved will be lost."),
+    }
+}
+
 pub fn notif_warning_title(lang: &str) -> &'static str {
     match lang {
         "es" => "Tiempo de pantalla",

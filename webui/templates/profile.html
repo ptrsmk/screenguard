@@ -325,6 +325,18 @@ SGDayRules.mount(document.getElementById('windowsRules'), {
         {{ t('profile.keep_tasks_running_hint') }}
       </p>
       <div class="mb-3" style="max-width:260px">
+        <label class="form-label" for="saveWindowSeconds">
+          {{ t('profile.save_window_label') }}
+        </label>
+        <div class="input-group input-group-sm">
+          <input class="form-control" type="number" id="saveWindowSeconds"
+                 name="save_window_seconds" min="0" max="300"
+                 value="{{ save_window_seconds }}">
+          <span class="input-group-text">{{ t('profile.save_window_unit') }}</span>
+        </div>
+        <div class="form-text">{{ t('profile.save_window_hint') }}</div>
+      </div>
+      <div class="mb-3" style="max-width:260px">
         <label class="form-label" for="lockoutGraceMinutes">
           {{ t('profile.grace_minutes_label') }}
         </label>

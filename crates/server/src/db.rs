@@ -114,7 +114,8 @@ async fn create_tables(pool: &DbPool) -> Result<()> {
             profile_id              TEXT NOT NULL PRIMARY KEY REFERENCES user_profiles(id) ON DELETE CASCADE,
             lockout_grace_minutes   INTEGER NOT NULL DEFAULT 5,
             warning_thresholds      TEXT NOT NULL DEFAULT '15,5,1',
-            preserve_tasks_on_lock  INTEGER NOT NULL DEFAULT 0
+            preserve_tasks_on_lock  INTEGER NOT NULL DEFAULT 0,
+            save_window_seconds     INTEGER NOT NULL DEFAULT 30
         )",
         "CREATE TABLE IF NOT EXISTS daily_usage (
             agent_user_id TEXT NOT NULL REFERENCES agent_users(id) ON DELETE CASCADE,
@@ -285,6 +286,7 @@ async fn run_migrations(pool: &DbPool, is_sqlite: bool) -> Result<()> {
     if v < 15 { apply_v15(pool).await?; v = 15; set_schema_version(pool, v).await?; }
     if v < 16 { apply_v16(pool).await?; v = 16; set_schema_version(pool, v).await?; }
     if v < 17 { apply_v17(pool).await?; v = 17; set_schema_version(pool, v).await?; }
+    if v < 18 { apply_v18(pool).await?; v = 18; set_schema_version(pool, v).await?; }
 
     Ok(())
 }
@@ -587,6 +589,19 @@ pub(crate) async fn apply_v17(pool: &DbPool) -> Result<()> {
     Ok(())
 }
 
+/// v18: seconds the child gets to save their work, with a warning on screen, before
+/// the session locks (0 = lock straight away).
+pub(crate) async fn apply_v18(pool: &DbPool) -> Result<()> {
+    // create_tables already has the column on databases created after v18
+    if sqlx::query("SELECT save_window_seconds FROM enforcement_settings LIMIT 1").fetch_optional(pool).await.is_err() {
+        sqlx::query("ALTER TABLE enforcement_settings ADD COLUMN save_window_seconds INTEGER NOT NULL DEFAULT 30")
+            .execute(pool)
+            .await?;
+    }
+    tracing::info!("DB migration v18 applied (save window before lock)");
+    Ok(())
+}
+
 // ── models ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -680,6 +695,7 @@ pub struct EnforcementSettings {
     pub lockout_grace_minutes: i32,
     pub preserve_tasks_on_lock: bool,
     pub warning_thresholds: Vec<i32>,
+    pub save_window_seconds: i32,
 }
 
 // ── admin_users ───────────────────────────────────────────────────────────────
@@ -1576,20 +1592,21 @@ pub async fn get_enforcement_settings(
     profile_id: Uuid,
 ) -> Result<EnforcementSettings> {
     let row = sqlx::query(
-        "SELECT lockout_grace_minutes, warning_thresholds, preserve_tasks_on_lock
+        "SELECT lockout_grace_minutes, warning_thresholds, preserve_tasks_on_lock, save_window_seconds
          FROM enforcement_settings WHERE profile_id=$1",
     )
     .bind(profile_id.to_string())
     .fetch_optional(pool)
     .await?;
 
-    let (grace, thresholds_str, preserve_i32) = match row {
+    let (grace, thresholds_str, preserve_i32, save_window) = match row {
         Some(r) => (
             r.get::<i32, _>("lockout_grace_minutes"),
             r.get::<String, _>("warning_thresholds"),
             r.get::<i32, _>("preserve_tasks_on_lock"),
+            r.get::<i32, _>("save_window_seconds"),
         ),
-        None => (5, "15,5,1".to_string(), 0),
+        None => (5, "15,5,1".to_string(), 0, 30),
     };
 
     let thresholds = thresholds_str
@@ -1601,7 +1618,23 @@ pub async fn get_enforcement_settings(
         lockout_grace_minutes: grace,
         preserve_tasks_on_lock: preserve_i32 != 0,
         warning_thresholds: thresholds,
+        save_window_seconds: save_window,
     })
+}
+
+pub async fn set_save_window_seconds(
+    pool: &DbPool,
+    profile_id: Uuid,
+    seconds: u32,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE enforcement_settings SET save_window_seconds=$1 WHERE profile_id=$2",
+    )
+    .bind(seconds as i32)
+    .bind(profile_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn set_preserve_tasks_on_lock(
@@ -2054,8 +2087,11 @@ mod tests {
             .await
             .unwrap();
         apply_v5(&pool).await.unwrap();
+        apply_v18(&pool).await.unwrap();
 
-        assert!(!get_enforcement_settings(&pool, id).await.unwrap().preserve_tasks_on_lock);
+        let settings = get_enforcement_settings(&pool, id).await.unwrap();
+        assert!(!settings.preserve_tasks_on_lock);
+        assert_eq!(settings.save_window_seconds, 30);
     }
 
     #[tokio::test]
@@ -2504,7 +2540,7 @@ mod tests {
         assert_eq!(get_agent_by_id(&pool, id).await.unwrap().unwrap().app_usage_available, Some(true));
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_usage").fetch_one(&pool).await.unwrap();
         assert_eq!(n, 0);
-        assert_eq!(get_schema_version(&pool, true).await.unwrap(), 17);
+        assert_eq!(get_schema_version(&pool, true).await.unwrap(), 18);
     }
 
     #[tokio::test]
