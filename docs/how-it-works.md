@@ -54,6 +54,9 @@ Screen time counts while the child is active at the computer: the session is unl
 Each profile has two locking modes (**Lock behavior** on the profile page):
 
 - **Default (keep tasks running off):** the session is locked, and after the grace period (5 minutes by default) the graphical session is terminated.
+  The agent first asks KDE or GNOME to log out normally, then stops the user's services (`user@UID.service`, which holds the compositor), then kills the user's processes in the session, leaving the display manager's helper running so the login screen comes back. `KillSession` is the last resort.
+
+**Time to save work before the lock** (profile page, default 30 s, 0 turns it off): when time runs out, a warning that stays on screen tells the child to save now, and the lock follows after that many seconds. If time is added meanwhile, nothing is locked.
 - **Keep tasks running on:** the session is locked and re-locked for as long as access stays blocked, without terminating it. Apps and unsaved work keep running; once time is added, the child continues where they left off.
 
 In both modes **Lock** on the profile page zeroes the remaining time for today.
